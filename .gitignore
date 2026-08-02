@@ -1,0 +1,20 @@
+# 金鑰
+.env
+.env.*
+!.env.example
+
+# 側錄下來的請求
+# 這些內容裡有你自己的 system prompt 與對話紀錄，不要進版控
+captured/
+request-*.json
+*.har
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
