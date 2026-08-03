@@ -7,6 +7,7 @@
 - [Day 01 - Claude Code 其實就只是一個 while 迴圈](https://kaochenlong.com/build-your-own-claude-code)
 - [Day 02 - 側錄 Claude Code！](https://kaochenlong.com/inspect-claude-code-requests)
 - [Day 03 - 第一個 API 請求](https://kaochenlong.com/first-anthropic-api-request)
+- [Day 04 - 讓模型假裝有記憶](https://kaochenlong.com/give-an-ai-chat-memory)
 
 by eddie@5xcampus.com
 
