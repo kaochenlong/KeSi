@@ -8,6 +8,7 @@
 - [Day 02 - 側錄 Claude Code！](https://kaochenlong.com/inspect-claude-code-requests)
 - [Day 03 - 第一個 API 請求](https://kaochenlong.com/first-anthropic-api-request)
 - [Day 04 - 讓模型假裝有記憶](https://kaochenlong.com/give-an-ai-chat-memory)
+- [Day 05 - 模型怎麼使用工具](https://kaochenlong.com/how-ai-models-use-tools)
 
 by eddie@5xcampus.com
 
