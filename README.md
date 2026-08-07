@@ -10,6 +10,7 @@
 - [Day 04 - 讓模型假裝有記憶](https://kaochenlong.com/give-an-ai-chat-memory)
 - [Day 05 - 模型怎麼使用工具](https://kaochenlong.com/how-ai-models-use-tools)
 - [Day 06 - 第一個工具 read_file](https://kaochenlong.com/build-a-read-file-tool)
+- [Day 07 - 開眼！看見整個專案](https://kaochenlong.com/let-an-agent-see-the-project)
 
 by eddie@5xcampus.com
 
