@@ -4,6 +4,8 @@
 # ///
 
 import readline  # 支援上下鍵翻歷史，不過 Windows 沒有這個模組
+import shutil
+import subprocess
 from pathlib import Path, PureWindowsPath
 
 import anthropic
@@ -21,6 +23,14 @@ IGNORE = {
     ".pytest_cache",
 }
 MAX_LIST_FILES = 200
+MAX_SEARCH_LINES = 100
+MAX_ERROR_CHARS = 2000
+RG_PATH = shutil.which("rg")
+RG_EXCLUDES = [
+    glob
+    for name in sorted(IGNORE)
+    for glob in (f"!**/{name}", f"!**/{name}/**")
+] + ["!**/.env.*", "!**/.env.*/**"]
 
 
 def safe_path(path):
@@ -138,6 +148,76 @@ def glob_files(pattern):
     return "\n".join(matches), False
 
 
+def grep(pattern, path="."):
+    if not isinstance(pattern, str) or not pattern:
+        return "錯誤：pattern 不可為空。", True
+
+    target = safe_path(path)
+    if target is None:
+        return f"錯誤：找不到或不允許搜尋路徑 {path}", True
+    if is_ignored(target):
+        return "錯誤：這個路徑不開放搜尋。", True
+    if not (target.is_file() or target.is_dir()):
+        return f"錯誤：{path} 不是可以搜尋的檔案或目錄", True
+    if RG_PATH is None:
+        return "錯誤：找不到 rg 指令，請先安裝 ripgrep。", True
+
+    relative_path = target.relative_to(BASE_DIR).as_posix() or "."
+    args = [
+        RG_PATH,
+        "--no-config",
+        "--no-follow",
+        "--line-number",
+        "--with-filename",
+        "--no-heading",
+        "--color",
+        "never",
+        "--max-columns",
+        "200",
+        "--max-columns-preview",
+    ]
+    for excluded in RG_EXCLUDES:
+        args.extend(["--glob", excluded])
+    args.extend(["--", pattern, relative_path])
+
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=BASE_DIR,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except FileNotFoundError:
+        return "錯誤：找不到 rg 指令，請先安裝 ripgrep。", True
+    except subprocess.TimeoutExpired:
+        return "錯誤：搜尋超過 10 秒被中止，請縮小範圍後再試。", True
+    except OSError as exc:
+        return f"錯誤：無法執行搜尋：{exc}", True
+
+    if proc.returncode == 1:
+        return f"找不到含有 {pattern} 的內容。", False
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or "rg 沒有提供錯誤訊息"
+        return f"搜尋失敗：{detail[:MAX_ERROR_CHARS]}", True
+
+    lines = []
+    for line in proc.stdout.splitlines():
+        if line.startswith(("./", ".\\")):
+            line = line[2:]
+        lines.append(line)
+    if len(lines) > MAX_SEARCH_LINES:
+        head = "\n".join(lines[:MAX_SEARCH_LINES])
+        return (
+            f"{head}\n（共有 {len(lines)} 行，只顯示前 {MAX_SEARCH_LINES} 行）",
+            False,
+        )
+    return "\n".join(lines), False
+
+
 TOOLS = [
     {
         "name": "read_file",
@@ -190,12 +270,35 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "grep",
+        "description": "在工作目錄的檔案內容中搜尋文字，支援正規表達式，"
+        "回傳「檔名:行號:該行內容」格式。想知道某個函式、變數或字串"
+        "出現在哪些檔案時用這個，不要一個一個檔案讀。",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "要搜尋的文字或正規表達式",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "限定搜尋的檔案或子目錄，省略時搜整個工作目錄",
+                },
+            },
+            "required": ["pattern"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 TOOL_FUNCS = {
     "read_file": read_file,
     "list_files": list_files,
     "glob": glob_files,
+    "grep": grep,
 }
 
 

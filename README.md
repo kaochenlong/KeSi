@@ -11,6 +11,7 @@
 - [Day 05 - 模型怎麼使用工具](https://kaochenlong.com/how-ai-models-use-tools)
 - [Day 06 - 第一個工具 read_file](https://kaochenlong.com/build-a-read-file-tool)
 - [Day 07 - 開眼！看見整個專案](https://kaochenlong.com/let-an-agent-see-the-project)
+- [Day 08 - 在專案裡搜尋](https://kaochenlong.com/search-code-with-ripgrep)
 
 by eddie@5xcampus.com
 
