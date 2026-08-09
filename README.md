@@ -13,6 +13,7 @@
 - [Day 07 - 開眼！看見整個專案](https://kaochenlong.com/let-an-agent-see-the-project)
 - [Day 08 - 在專案裡搜尋](https://kaochenlong.com/search-code-with-ripgrep)
 - [Day 09 - 改 code 為什麼用字串替換](https://kaochenlong.com/edit-code-with-string-replacement)
+- [Day 10 - write_file 的防呆機制](https://kaochenlong.com/write-file-without-overwriting)
 
 by eddie@5xcampus.com
 

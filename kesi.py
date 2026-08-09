@@ -3,14 +3,17 @@
 # dependencies = ["anthropic"]
 # ///
 
+import hashlib
+import os
 import readline  # 支援上下鍵翻歷史，不過 Windows 沒有這個模組
 import shutil
+import stat
 import subprocess
+import tempfile
 from pathlib import Path, PureWindowsPath
 
 import anthropic
 
-client = anthropic.Anthropic()
 BASE_DIR = Path.cwd().resolve()
 IGNORE = {
     ".git",
@@ -31,6 +34,7 @@ RG_EXCLUDES = [
     for name in sorted(IGNORE)
     for glob in (f"!**/{name}", f"!**/{name}/**")
 ] + ["!**/.env.*", "!**/.env.*/**"]
+READ_VERSIONS = {}
 
 
 def safe_path(path):
@@ -39,6 +43,29 @@ def safe_path(path):
     except (OSError, RuntimeError, TypeError, ValueError):
         return None
     return target if target.is_relative_to(BASE_DIR) else None
+
+
+def safe_write_path(path):
+    if not isinstance(path, str) or not path.strip():
+        return None
+
+    path_obj = Path(path)
+    windows_path = PureWindowsPath(path)
+    if (
+        path.startswith("~")
+        or path_obj.is_absolute()
+        or windows_path.drive
+        or windows_path.root
+    ):
+        return None
+
+    try:
+        target = (BASE_DIR / path_obj).resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if target == BASE_DIR or not target.is_relative_to(BASE_DIR):
+        return None
+    return target
 
 
 def is_ignored(target):
@@ -52,7 +79,15 @@ def is_ignored(target):
     )
 
 
+def file_digest(data):
+    return hashlib.sha256(data).digest()
+
+
 def read_file(file_path):
+    recorded_target = safe_write_path(file_path)
+    if recorded_target is not None:
+        READ_VERSIONS.pop(recorded_target, None)
+
     target = safe_path(file_path)
     if target is None:
         return f"錯誤：找不到或不允許存取檔案 {file_path}", True
@@ -62,11 +97,14 @@ def read_file(file_path):
         return f"錯誤：不是可以讀取的文字檔 {file_path}", True
 
     try:
-        return target.read_bytes().decode("utf-8"), False
+        data = target.read_bytes()
+        content = data.decode("utf-8")
     except UnicodeDecodeError:
         return f"錯誤：檔案不是 UTF-8 文字檔 {file_path}", True
     except OSError as exc:
         return f"錯誤：無法讀取檔案 {file_path}：{exc}", True
+    READ_VERSIONS[target] = file_digest(data)
+    return content, False
 
 
 def edit_file(file_path, old_string, new_string):
@@ -109,13 +147,7 @@ def edit_file(file_path, old_string, new_string):
             True,
         )
 
-    prefix = content[:first]
-    line_no = (
-        prefix.count("\n")
-        + prefix.count("\r")
-        - prefix.count("\r\n")
-        + 1
-    )
+    line_no = content[:first].count("\n") + 1
     new_content = (
         content[:first] + new_string + content[first + len(old_string):]
     )
@@ -125,8 +157,126 @@ def edit_file(file_path, old_string, new_string):
     except UnicodeEncodeError:
         return "錯誤：new_string 含有無法寫成 UTF-8 的內容。", True
     except OSError as exc:
+        READ_VERSIONS.pop(target, None)
         return f"錯誤：無法寫入檔案 {file_path}：{exc}", True
+    READ_VERSIONS.pop(target, None)
     return f"替換完成（從第 {line_no} 行開始）。", False
+
+
+def replace_existing_file(target, data, expected_digest):
+    temp_path = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+
+        latest = target.read_bytes()
+        if file_digest(latest) != expected_digest:
+            return "錯誤：檔案在讀取後又有變更，請重新 read_file 後再覆寫。"
+
+        mode = stat.S_IMODE(target.stat().st_mode)
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, target)
+        temp_path = None
+        return None
+    except OSError as exc:
+        return f"錯誤：無法覆寫檔案：{exc}"
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def write_file(file_path, content):
+    if not isinstance(file_path, str) or not isinstance(content, str):
+        return "錯誤：file_path 與 content 都必須是字串。", True
+
+    try:
+        data = content.encode("utf-8")
+    except UnicodeEncodeError:
+        return "錯誤：content 含有無法寫成 UTF-8 的內容。", True
+
+    target = safe_write_path(file_path)
+    if target is None:
+        return f"錯誤：不允許寫入路徑 {file_path}", True
+    if is_ignored(target):
+        return "錯誤：這個路徑不開放寫入。", True
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f"錯誤：無法建立上層目錄 {file_path}：{exc}", True
+
+    target = safe_write_path(file_path)
+    if target is None or is_ignored(target):
+        return f"錯誤：不允許寫入路徑 {file_path}", True
+
+    if target.exists():
+        if not target.is_file():
+            return f"錯誤：不是可以覆寫的文字檔 {file_path}", True
+
+        expected_digest = READ_VERSIONS.get(target)
+        if expected_digest is None:
+            return (
+                "錯誤：覆寫既有檔案前，必須先用 read_file 讀取目前內容。",
+                True,
+            )
+
+        try:
+            current = target.read_bytes()
+        except OSError as exc:
+            READ_VERSIONS.pop(target, None)
+            return f"錯誤：無法確認檔案目前內容 {file_path}：{exc}", True
+
+        if file_digest(current) != expected_digest:
+            READ_VERSIONS.pop(target, None)
+            return (
+                "錯誤：檔案在讀取後又有變更，請重新 read_file 後再覆寫。",
+                True,
+            )
+        if current == data:
+            return "檔案內容相同，不需要覆寫。", False
+
+        error = replace_existing_file(target, data, expected_digest)
+        READ_VERSIONS.pop(target, None)
+        if error is not None:
+            return error, True
+        return f"已覆寫 {file_path}（{len(data)} bytes）。", False
+
+    created_identity = None
+    try:
+        with target.open("xb") as file:
+            info = os.fstat(file.fileno())
+            created_identity = (info.st_dev, info.st_ino)
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+    except FileExistsError:
+        return (
+            "錯誤：檔案剛被其他程式建立，請先用 read_file 讀取後再決定。",
+            True,
+        )
+    except OSError as exc:
+        if created_identity is not None:
+            try:
+                info = target.stat()
+                if (info.st_dev, info.st_ino) == created_identity:
+                    target.unlink()
+            except OSError:
+                pass
+        return f"錯誤：無法建立檔案 {file_path}：{exc}", True
+
+    READ_VERSIONS.pop(target, None)
+    return f"已建立 {file_path}（{len(data)} bytes）。", False
 
 
 def list_files(path="."):
@@ -379,6 +529,29 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "write_file",
+        "description": "建立新的 UTF-8 文字檔，或用完整內容覆寫既有檔案。"
+        "修改既有檔案的一小部分時優先使用 edit_file。"
+        "若確定要覆寫既有檔案，必須先用 read_file 讀取目前版本；"
+        "檔案在讀取後若又有變更，write_file 會拒絕覆寫。",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "相對於工作目錄的檔案路徑",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "要寫入檔案的完整 UTF-8 文字內容",
+                },
+            },
+            "required": ["file_path", "content"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 TOOL_FUNCS = {
@@ -387,10 +560,11 @@ TOOL_FUNCS = {
     "glob": glob_files,
     "grep": grep,
     "edit_file": edit_file,
+    "write_file": write_file,
 }
 
 
-def run_agent(history):
+def run_agent(client, history):
     while True:
         resp = client.messages.create(
             model="claude-haiku-4-5",
@@ -398,6 +572,17 @@ def run_agent(history):
             tools=TOOLS,
             messages=history,
         )
+
+        if resp.stop_reason in ("max_tokens", "model_context_window_exceeded"):
+            reason = (
+                "輸出達到 max_tokens"
+                if resp.stop_reason == "max_tokens"
+                else "回應填滿 context window"
+            )
+            message = f"錯誤：模型{reason}，本輪沒有執行工具。"
+            history.append({"role": "assistant", "content": message})
+            return message
+
         history.append({"role": "assistant", "content": resp.content})
 
         if resp.stop_reason != "tool_use":
@@ -429,21 +614,28 @@ def run_agent(history):
         history.append({"role": "user", "content": results})
 
 
-history = []
-print("KeSi。輸入 /exit 離開、/reset 清空對話。")
-while True:
-    try:
-        user = input("你 > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        break
-    if user in ("/exit", "/quit"):
-        break
-    if user == "/reset":
-        history = []
-        print("（日記已清空，我們重新開始）")
-        continue
-    if not user:
-        continue
+def main():
+    client = anthropic.Anthropic()
+    history = []
+    print("KeSi。輸入 /exit 離開、/reset 清空對話。")
+    while True:
+        try:
+            user = input("你 > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if user in ("/exit", "/quit"):
+            break
+        if user == "/reset":
+            history = []
+            READ_VERSIONS.clear()
+            print("（日記與檔案版本紀錄已清空，我們重新開始）")
+            continue
+        if not user:
+            continue
 
-    history.append({"role": "user", "content": user})
-    print("KeSi >", run_agent(history))
+        history.append({"role": "user", "content": user})
+        print("KeSi >", run_agent(client, history))
+
+
+if __name__ == "__main__":
+    main()
