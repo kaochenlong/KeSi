@@ -62,11 +62,71 @@ def read_file(file_path):
         return f"錯誤：不是可以讀取的文字檔 {file_path}", True
 
     try:
-        return target.read_text(encoding="utf-8"), False
+        return target.read_bytes().decode("utf-8"), False
     except UnicodeDecodeError:
         return f"錯誤：檔案不是 UTF-8 文字檔 {file_path}", True
     except OSError as exc:
         return f"錯誤：無法讀取檔案 {file_path}：{exc}", True
+
+
+def edit_file(file_path, old_string, new_string):
+    if not all(
+        isinstance(value, str)
+        for value in (file_path, old_string, new_string)
+    ):
+        return "錯誤：file_path、old_string、new_string 都必須是字串。", True
+    if not old_string:
+        return "錯誤：old_string 不可為空。", True
+    if old_string == new_string:
+        return "錯誤：old_string 與 new_string 相同，沒有內容需要修改。", True
+
+    target = safe_path(file_path)
+    if target is None:
+        return f"錯誤：找不到或不允許存取檔案 {file_path}", True
+    if is_ignored(target):
+        return "錯誤：這個檔案不開放修改。", True
+    if not target.is_file():
+        return f"錯誤：不是可以修改的文字檔 {file_path}", True
+
+    try:
+        content = target.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        return f"錯誤：檔案不是 UTF-8 文字檔 {file_path}", True
+    except OSError as exc:
+        return f"錯誤：無法讀取檔案 {file_path}：{exc}", True
+
+    first = content.find(old_string)
+    if first == -1:
+        return (
+            "錯誤：在檔案裡找不到要替換的文字。old_string 必須與檔案內容"
+            "完全一致（包含空白、縮排與換行），請先用 read_file 確認目前內容。",
+            True,
+        )
+    if content.find(old_string, first + 1) != -1:
+        return (
+            "錯誤：要替換的文字在檔案裡不只出現一次，無法確定要改哪一處。"
+            "請加長 old_string、納入更多前後文，使它在檔案中唯一。",
+            True,
+        )
+
+    prefix = content[:first]
+    line_no = (
+        prefix.count("\n")
+        + prefix.count("\r")
+        - prefix.count("\r\n")
+        + 1
+    )
+    new_content = (
+        content[:first] + new_string + content[first + len(old_string):]
+    )
+    try:
+        encoded = new_content.encode("utf-8")
+        target.write_bytes(encoded)
+    except UnicodeEncodeError:
+        return "錯誤：new_string 含有無法寫成 UTF-8 的內容。", True
+    except OSError as exc:
+        return f"錯誤：無法寫入檔案 {file_path}：{exc}", True
+    return f"替換完成（從第 {line_no} 行開始）。", False
 
 
 def list_files(path="."):
@@ -292,6 +352,33 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "edit_file",
+        "description": "修改既有 UTF-8 文字檔：把 old_string 替換成 new_string。"
+        "old_string 必須與檔案現有內容完全一致（含空白、縮排與換行），"
+        "而且在檔案中只出現一次；不唯一時請加長前後文。"
+        "修改前應先用 read_file 讀取目前內容。",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "相對於工作目錄的既有檔案路徑",
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "要被替換的原文，需完全一致、非空且唯一",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "替換後的新內容，可為空字串以刪除原文",
+                },
+            },
+            "required": ["file_path", "old_string", "new_string"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 TOOL_FUNCS = {
@@ -299,6 +386,7 @@ TOOL_FUNCS = {
     "list_files": list_files,
     "glob": glob_files,
     "grep": grep,
+    "edit_file": edit_file,
 }
 
 
