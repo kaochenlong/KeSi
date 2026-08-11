@@ -7,9 +7,12 @@ import hashlib
 import os
 import readline  # 支援上下鍵翻歷史，不過 Windows 沒有這個模組
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path, PureWindowsPath
 
 import anthropic
@@ -28,6 +31,11 @@ IGNORE = {
 MAX_LIST_FILES = 200
 MAX_SEARCH_LINES = 100
 MAX_ERROR_CHARS = 2000
+MAX_OUTPUT_BYTES = 8000
+MAX_CAPTURE_BYTES = 1_000_000
+COMMAND_TIMEOUT = 120
+KILL_GRACE_SECONDS = 3
+SHELL_PATH = "/bin/sh"
 RG_PATH = shutil.which("rg")
 RG_EXCLUDES = [
     glob
@@ -428,6 +436,123 @@ def grep(pattern, path="."):
     return "\n".join(lines), False
 
 
+def stop_process_group(proc):
+    pgid = proc.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return
+
+    deadline = time.monotonic() + KILL_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        proc.poll()
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        except OSError:
+            return
+        time.sleep(0.05)
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def drain_output(proc, captured, state):
+    try:
+        while True:
+            chunk = proc.stdout.read1(65536)
+            if not chunk:
+                break
+            remaining = MAX_CAPTURE_BYTES - len(captured)
+            if len(chunk) > remaining:
+                captured.extend(chunk[:remaining])
+                state["overflow"] = True
+                stop_process_group(proc)
+                break
+            captured.extend(chunk)
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+
+
+def clip_output(data):
+    if len(data) <= MAX_OUTPUT_BYTES:
+        return data.decode("utf-8", errors="replace")
+
+    half = MAX_OUTPUT_BYTES // 2
+    head = data[:half].decode("utf-8", errors="replace")
+    tail = data[-half:].decode("utf-8", errors="replace")
+    dropped = len(data) - half * 2
+    return f"{head}\n（中間省略 {dropped} bytes）\n{tail}"
+
+
+def run_command(command):
+    if not isinstance(command, str) or not command.strip():
+        return "錯誤：command 不可為空。", True
+
+    env = os.environ.copy()
+    env.pop("ANTHROPIC_API_KEY", None)
+
+    try:
+        proc = subprocess.Popen(
+            [SHELL_PATH, "-c", command],
+            cwd=BASE_DIR,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return f"錯誤：無法執行指令：{exc}", True
+
+    captured = bytearray()
+    state = {"overflow": False}
+    reader = threading.Thread(
+        target=drain_output,
+        args=(proc, captured, state),
+        daemon=True,
+    )
+    reader.start()
+
+    timed_out = False
+    try:
+        try:
+            proc.wait(timeout=COMMAND_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    finally:
+        stop_process_group(proc)
+        proc.wait()
+        reader.join(timeout=KILL_GRACE_SECONDS)
+
+    output = clip_output(captured)
+    notes = []
+    if timed_out:
+        notes.append(f"指令超過 {COMMAND_TIMEOUT} 秒未結束，已終止")
+    if state["overflow"]:
+        notes.append(f"輸出超過 {MAX_CAPTURE_BYTES} bytes，已終止指令")
+
+    code = proc.returncode
+    if code is not None and code < 0:
+        notes.append(f"被訊號 {-code} 終止")
+    notes.append(f"結束碼 {code}")
+
+    summary = "".join(f"（{note}）" for note in notes)
+    is_error = bool(timed_out or state["overflow"] or code)
+    if not output:
+        return f"（指令沒有輸出）{summary}", is_error
+    separator = "" if output.endswith("\n") else "\n"
+    return f"{output}{separator}{summary}", is_error
+
+
 TOOLS = [
     {
         "name": "read_file",
@@ -552,6 +677,28 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "run_command",
+        "description": "在工作目錄執行一行 shell 指令，回傳合併後的輸出與結束碼。"
+        "用來跑測試、linter、建置或查 git 紀錄。"
+        f"指令最多執行 {COMMAND_TIMEOUT} 秒，超過會被終止；輸出過長會截斷。"
+        "沒有互動輸入可用，不要下需要等待輸入的指令。"
+        "每次都是全新的行程，cd 或環境變數不會留到下一次呼叫，"
+        "需要換目錄時請在同一行用 cd x && ...。"
+        "讀寫檔案請優先使用 read_file、edit_file 與 write_file。",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "要執行的完整 shell 指令，例如 pytest -q",
+                }
+            },
+            "required": ["command"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 TOOL_FUNCS = {
@@ -561,6 +708,7 @@ TOOL_FUNCS = {
     "grep": grep,
     "edit_file": edit_file,
     "write_file": write_file,
+    "run_command": run_command,
 }
 
 
