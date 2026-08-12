@@ -36,6 +36,8 @@ MAX_CAPTURE_BYTES = 1_000_000
 COMMAND_TIMEOUT = 120
 KILL_GRACE_SECONDS = 3
 SHELL_PATH = "/bin/sh"
+MAX_TURNS = 20
+MAX_TOOL_FAILURES = 3
 RG_PATH = shutil.which("rg")
 RG_EXCLUDES = [
     glob
@@ -712,14 +714,123 @@ TOOL_FUNCS = {
 }
 
 
-def run_agent(client, history):
-    while True:
-        resp = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=1024,
-            tools=TOOLS,
-            messages=history,
+def call_tool(block):
+    func = TOOL_FUNCS.get(block.name)
+    if func is None:
+        return f"錯誤：沒有 {block.name} 這個工具。", True
+    try:
+        return func(**block.input)
+    except TypeError as exc:
+        return f"錯誤：{block.name} 的參數不正確：{exc}", True
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        return f"錯誤：{block.name} 執行失敗：{type(exc).__name__}", True
+
+
+def tool_result(block_id, output, is_error):
+    return {
+        "type": "tool_result",
+        "tool_use_id": block_id,
+        "content": output,
+        "is_error": is_error,
+    }
+
+
+def run_tools(blocks):
+    results = []
+    interrupted = False
+    for block in blocks:
+        if block.type != "tool_use":
+            continue
+        if interrupted:
+            results.append(
+                tool_result(block.id, "錯誤：這一輪已中斷，工具沒有執行。", True)
+            )
+            continue
+
+        print(f"  [執行工具] {block.name}({block.input})")
+        try:
+            output, is_error = call_tool(block)
+        except KeyboardInterrupt:
+            interrupted = True
+            output, is_error = "錯誤：使用者中斷了這個工具。", True
+        results.append(tool_result(block.id, output, is_error))
+    return results, interrupted
+
+
+def block_type(block):
+    if isinstance(block, dict):
+        return block.get("type")
+    return getattr(block, "type", None)
+
+
+def block_id(block):
+    if isinstance(block, dict):
+        return block.get("id")
+    return getattr(block, "id", None)
+
+
+def seal_dangling_tool_use(history):
+    """補上懸空許願單的結果，否則這本日記再也送不出去。"""
+    if not history or history[-1].get("role") != "assistant":
+        return False
+
+    content = history[-1].get("content")
+    if not isinstance(content, list):
+        return False
+
+    pending = [b for b in content if block_type(b) == "tool_use"]
+    if not pending:
+        return False
+
+    history.append({
+        "role": "user",
+        "content": [
+            tool_result(
+                block_id(b),
+                "錯誤：使用者中斷，這個工具的執行狀態不明；"
+                "重試前請先檢查現況。",
+                True,
+            )
+            for b in pending
+        ],
+    })
+    return True
+
+
+def describe_api_error(exc):
+    """這裡的讀者是人，不是模型；模型根本沒收到這個請求。"""
+    if isinstance(exc, anthropic.RateLimitError):
+        return "錯誤：重試後仍被限流（429），等一下再試。"
+    if isinstance(exc, anthropic.OverloadedError):
+        return "錯誤：伺服器忙碌中（529），重試後仍未成功，等一下再試。"
+    if isinstance(exc, anthropic.BadRequestError):
+        return (
+            f"錯誤：請求被拒絕（400）：{exc}。"
+            "如果是對話太長，可以用 /reset 清空後重來。"
         )
+    if isinstance(exc, anthropic.APITimeoutError):
+        return "錯誤：等待模型回應逾時。"
+    if isinstance(exc, anthropic.APIConnectionError):
+        return f"錯誤：連不上 API：{exc}"
+    if isinstance(exc, anthropic.APIStatusError):
+        return f"錯誤：API 回應 {exc.status_code}：{exc}"
+    return f"錯誤：{type(exc).__name__}：{exc}"
+
+
+def run_agent(client, history):
+    failures = 0
+    for turn in range(1, MAX_TURNS + 1):
+        try:
+            resp = client.messages.create(
+                model="claude-haiku-4-5",
+                max_tokens=1024,
+                tools=TOOLS,
+                messages=history,
+            )
+        except anthropic.AnthropicError as exc:
+            return describe_api_error(exc)
 
         if resp.stop_reason in ("max_tokens", "model_context_window_exceeded"):
             reason = (
@@ -736,30 +847,32 @@ def run_agent(client, history):
         if resp.stop_reason != "tool_use":
             return "".join(b.text for b in resp.content if b.type == "text")
 
-        results = []
-        for block in resp.content:
-            if block.type == "tool_use":
-                print(f"  [執行工具] {block.name}({block.input})")
-                func = TOOL_FUNCS.get(block.name)
-                if func is None:
-                    output = f"錯誤：沒有 {block.name} 這個工具。"
-                    is_error = True
-                else:
-                    try:
-                        output, is_error = func(**block.input)
-                    except TypeError as exc:
-                        output = f"錯誤：{block.name} 的參數不正確：{exc}"
-                        is_error = True
-                    except Exception as exc:
-                        output = f"錯誤：{block.name} 執行失敗：{type(exc).__name__}"
-                        is_error = True
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                    "is_error": is_error,
-                })
+        results, interrupted = run_tools(resp.content)
         history.append({"role": "user", "content": results})
+
+        if interrupted:
+            message = "（這一輪被中斷了，還沒完成的工作沒有繼續）"
+            history.append({"role": "assistant", "content": message})
+            return message
+
+        if all(result["is_error"] for result in results):
+            failures += 1
+            if failures >= MAX_TOOL_FAILURES:
+                message = (
+                    f"錯誤：工具連續 {MAX_TOOL_FAILURES} 輪全部失敗，"
+                    f"在第 {turn} 圈停下來，請換個方式再試。"
+                )
+                history.append({"role": "assistant", "content": message})
+                return message
+        else:
+            failures = 0
+
+    message = (
+        f"錯誤：這一輪已經用掉 {MAX_TURNS} 次模型往返還沒有結論，先停下來。"
+        "可以換個問法、把任務拆小，或用 /reset 重來。"
+    )
+    history.append({"role": "assistant", "content": message})
+    return message
 
 
 def main():
@@ -782,7 +895,11 @@ def main():
             continue
 
         history.append({"role": "user", "content": user})
-        print("KeSi >", run_agent(client, history))
+        try:
+            print("KeSi >", run_agent(client, history))
+        except KeyboardInterrupt:
+            seal_dangling_tool_use(history)
+            print("\n（已中斷，可以接著問下一句）")
 
 
 if __name__ == "__main__":
