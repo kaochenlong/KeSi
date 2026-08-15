@@ -75,6 +75,30 @@ SEGMENT_SPLIT = re.compile(r"[;&|\n]+")
 
 GRANTED_COMMANDS = set()   # session 內同意過的指令
 GRANTED_WRITES = set()     # session 內同意可以修改的檔案
+
+# 開發工具鏈常常裝在家目錄裡，把家目錄整個關掉會先打死自己的 python
+TOOLCHAIN_DIRS = [
+    ".local", ".cargo", ".rustup", ".bun", ".deno", ".volta",
+    ".pyenv", ".rbenv", ".nodenv", ".nvm", ".asdf", ".mise", ".sdkman",
+    ".gem", ".npm", ".yarn", ".pnpm", ".cache/uv", ".cache/pip",
+]
+SENSITIVE_ENV_NAMES = {
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "DATABASE_URL",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "REDIS_URL",
+    "SSH_AUTH_SOCK",
+}
+SENSITIVE_ENV_SUFFIXES = (
+    "_API_KEY",
+    "_CREDENTIALS",
+    "_PASSWORD",
+    "_SECRET",
+    "_TOKEN",
+)
+SANDBOX_EXEC = shutil.which("sandbox-exec") if sys.platform == "darwin" else None
+SANDBOX_DISABLED = os.environ.get("KESI_NO_SANDBOX") == "1"
 RG_PATH = shutil.which("rg")
 RG_EXCLUDES = [
     glob
@@ -475,6 +499,126 @@ def grep(pattern, path="."):
     return "\n".join(lines), False
 
 
+def sandbox_spec():
+    """產生 Seatbelt profile 與路徑參數，避免把路徑直接插進規則。
+
+    基底用 allow default 再逐項收緊，而不是 deny default 再逐項放行。
+    後者更嚴，但 dyld 需要的路徑列不全，shell 會直接 abort。
+    """
+    home = HOME_DIR
+    toolchains = [
+        home / name
+        for name in TOOLCHAIN_DIRS
+        if (home / name).is_dir()
+    ]
+    tmpdir = Path(tempfile.gettempdir()).resolve()
+    parameters = [
+        ("HOME_DIR", home),
+        ("BASE_DIR", BASE_DIR),
+        ("TMP_DIR", tmpdir),
+    ]
+
+    toolchain_rules = []
+    for index, path in enumerate(toolchains):
+        name = f"TOOLCHAIN_{index}"
+        parameters.append((name, path))
+        toolchain_rules.append(f'(subpath (param "{name}"))')
+    toolchain_filters = "\n  ".join(toolchain_rules)
+    ignored_names = "|".join(
+        r"\.env(\.[^/]*)?" if name == ".env" else re.escape(name)
+        for name in sorted(IGNORE)
+    )
+
+    profile = f"""(version 1)
+(allow default)
+
+; 讀：關掉家目錄與其他使用者的資料，再把工作目錄與工具鏈放回來
+(deny file-read*
+  (subpath (param "HOME_DIR"))
+  (subpath "/Users")
+  (subpath "/Volumes"))
+(allow file-read*
+  (subpath (param "BASE_DIR"))
+  {toolchain_filters})
+
+; getcwd() 要能走過父目錄，所以 metadata 一律放行，內容才是重點
+(allow file-read-metadata)
+
+; 工作目錄每一層的禁區，連 shell 也讀不到
+(deny file-read*
+  (regex
+    (string-append
+      "^"
+      (regex-quote (param "BASE_DIR"))
+      #"/(.*/)?({ignored_names})(/|$)")))
+
+; 寫：只有工作目錄、系統暫存與裝置介面
+(deny file-write*)
+(allow file-write*
+  (subpath (param "BASE_DIR"))
+  (subpath (param "TMP_DIR"))
+  (subpath "/private/var/folders")
+  (subpath "/dev"))
+
+; 網路：全部禁止
+(deny network*)
+"""
+    return profile, [(name, str(path)) for name, path in parameters]
+
+
+def sandbox_would_be_useless():
+    """工作目錄若是家目錄或其上層，工作目錄的讀寫邊界就會失效。"""
+    return BASE_DIR == HOME_DIR or HOME_DIR.is_relative_to(BASE_DIR)
+
+
+def sandbox_enabled():
+    return not SANDBOX_DISABLED and SANDBOX_EXEC is not None
+
+
+def sandbox_status():
+    if SANDBOX_DISABLED:
+        return "關閉（KESI_NO_SANDBOX=1）"
+    if SANDBOX_EXEC is None:
+        return f"沒有可用的沙箱（{sys.platform}），指令會直接在你的帳號下執行"
+    if sandbox_would_be_useless():
+        return "工作目錄邊界形同虛設：目前目錄是家目錄或它的上層，換一個目錄啟動"
+    return f"開啟（{SANDBOX_EXEC}）"
+
+
+def shell_argv(command):
+    """把指令包進沙箱；沒有沙箱可用時退回直接執行。"""
+    if not sandbox_enabled():
+        return [SHELL_PATH, "-c", command]
+    profile, parameters = sandbox_spec()
+    definitions = [
+        item
+        for name, value in parameters
+        for item in ("-D", f"{name}={value}")
+    ]
+    return [
+        SANDBOX_EXEC,
+        *definitions,
+        "-p",
+        profile,
+        SHELL_PATH,
+        "-c",
+        command,
+    ]
+
+
+def sandbox_environment():
+    """保留一般執行環境，但移除常見的憑證變數。"""
+    env = os.environ.copy()
+    for name in list(env):
+        upper_name = name.upper()
+        if (
+            upper_name in SENSITIVE_ENV_NAMES
+            or upper_name.endswith(SENSITIVE_ENV_SUFFIXES)
+        ):
+            env.pop(name, None)
+    return env
+
+
 def stop_process_group(proc):
     pgid = proc.pid
     try:
@@ -536,14 +680,11 @@ def run_command(command):
     if not isinstance(command, str) or not command.strip():
         return "錯誤：command 不可為空。", True
 
-    env = os.environ.copy()
-    env.pop("ANTHROPIC_API_KEY", None)
-
     try:
         proc = subprocess.Popen(
-            [SHELL_PATH, "-c", command],
+            shell_argv(command),
             cwd=BASE_DIR,
-            env=env,
+            env=sandbox_environment(),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1165,6 +1306,8 @@ def main():
     client = anthropic.Anthropic()
     history = []
     print("KeSi。輸入 /exit 離開、/reset 清空對話、/permissions 看授權、/revoke 收回授權。")
+    print(f"  工作目錄：{BASE_DIR}")
+    print(f"  指令沙箱：{sandbox_status()}")
     while True:
         try:
             user = input("你 > ").strip()
