@@ -5,11 +5,14 @@
 
 import hashlib
 import os
+import re
 import readline  # 支援上下鍵翻歷史，不過 Windows 沒有這個模組
+import shlex
 import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -18,6 +21,7 @@ from pathlib import Path, PureWindowsPath
 import anthropic
 
 BASE_DIR = Path.cwd().resolve()
+HOME_DIR = Path.home().resolve()
 IGNORE = {
     ".git",
     "node_modules",
@@ -38,6 +42,39 @@ KILL_GRACE_SECONDS = 3
 SHELL_PATH = "/bin/sh"
 MAX_TURNS = 20
 MAX_TOOL_FAILURES = 3
+
+# 唯讀工具不必問；它們仍受第 7 天的路徑柵欄與禁區名單約束
+READ_ONLY_TOOLS = {"read_file", "list_files", "glob", "grep"}
+
+# 只放真正不改變狀態的查看指令。單 token 或「指令 + 子指令」兩種寫法
+SAFE_COMMANDS = {
+    ("ls",), ("pwd",), ("cat",), ("head",), ("tail",), ("wc",),
+    ("echo",), ("which",), ("diff",), ("stat",), ("du",), ("date",),
+    ("git", "status"), ("git", "log"), ("git", "diff"), ("git", "show"),
+}
+
+# 這些 Git 參數會寫檔或執行外部程式，不能當成唯讀操作自動放行
+GIT_SENSITIVE_OPTIONS = {"--output", "--ext-diff", "--textconv"}
+
+# 紅線：即使使用者說 yes 也不執行
+BLOCKED_COMMANDS = {"sudo", "su", "doas"}
+REMOVAL_COMMANDS = {"rm", "rmdir", "shred", "srm"}
+HOME_TEXT = str(HOME_DIR)
+ROOT_TARGETS = {
+    "/", "/*", "~", "~/", "~/*", "$HOME", "$HOME/", "$HOME/*",
+    "${HOME}", "${HOME}/", "${HOME}/*", "/root", HOME_TEXT,
+    f"{HOME_TEXT}/", f"{HOME_TEXT}/*",
+}
+SIMPLE_WRAPPERS = {"command", "builtin", "nohup", "noglob"}
+SHELL_COMMANDS = {"sh", "bash", "zsh"}
+ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*", re.DOTALL)
+
+# 出現這些字元就代表這條指令會做的事超出字面，一律回頭問人
+SHELL_METACHARS = set("$`<>(){}[]*?!\\\n")
+SEGMENT_SPLIT = re.compile(r"[;&|\n]+")
+
+GRANTED_COMMANDS = set()   # session 內同意過的指令
+GRANTED_WRITES = set()     # session 內同意可以修改的檔案
 RG_PATH = shutil.which("rg")
 RG_EXCLUDES = [
     glob
@@ -714,6 +751,242 @@ TOOL_FUNCS = {
 }
 
 
+def command_segments(command):
+    """把複合指令拆成一段一段，每一段都要各自檢查。"""
+    return [part.strip() for part in SEGMENT_SPLIT.split(command) if part.strip()]
+
+
+def segment_tokens(segment):
+    try:
+        return shlex.split(segment)
+    except ValueError:
+        return None
+
+
+def unwrap_command(tokens):
+    """拆掉少數會直接執行後續指令的 wrapper，讓紅線看得到真正的指令。"""
+    tokens = list(tokens)
+    while tokens:
+        while tokens and ENV_ASSIGNMENT.fullmatch(tokens[0]):
+            tokens.pop(0)
+        if not tokens:
+            return []
+
+        if tokens[0] in SIMPLE_WRAPPERS:
+            tokens.pop(0)
+            if tokens and tokens[0] == "--":
+                tokens.pop(0)
+            continue
+
+        if tokens[0] != "env":
+            break
+
+        tokens.pop(0)
+        while tokens:
+            token = tokens[0]
+            if ENV_ASSIGNMENT.fullmatch(token):
+                tokens.pop(0)
+            elif token == "--":
+                tokens.pop(0)
+                break
+            elif token in ("-i", "--ignore-environment", "-0", "--null"):
+                tokens.pop(0)
+            elif token in ("-u", "--unset", "-C", "--chdir", "-S", "--split-string"):
+                tokens = tokens[2:] if len(tokens) > 1 else []
+            elif token.startswith(("--unset=", "--chdir=", "--split-string=")):
+                tokens.pop(0)
+            else:
+                break
+    return tokens
+
+
+def is_root_target(target):
+    if target in ROOT_TARGETS:
+        return True
+    try:
+        expanded = os.path.expandvars(os.path.expanduser(target))
+        if any(char in expanded for char in "*?["):
+            return False
+        path = Path(expanded)
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return resolved in (Path("/"), HOME_DIR)
+
+
+def is_root_removal(tokens):
+    if not tokens or tokens[0] not in REMOVAL_COMMANDS:
+        return False
+    targets = [token for token in tokens[1:] if not token.startswith("-")]
+    return any(is_root_target(target) for target in targets)
+
+
+def hard_denial_reason(command, depth=0):
+    if depth > 3:
+        return None
+    for segment in command_segments(command):
+        tokens = segment_tokens(segment)
+        if tokens is None:
+            continue
+        tokens = unwrap_command(tokens)
+        if not tokens:
+            continue
+        if tokens[0] in BLOCKED_COMMANDS:
+            return f"不允許提權指令 {tokens[0]}"
+        if is_root_removal(tokens):
+            return "這個指令會刪掉根目錄或家目錄"
+        if tokens[0] in SHELL_COMMANDS:
+            for index, option in enumerate(tokens[1:-1], start=1):
+                if option == "-c" or (option.startswith("-") and "c" in option[1:]):
+                    reason = hard_denial_reason(tokens[index + 1], depth + 1)
+                    if reason:
+                        return reason
+    return None
+
+
+def git_requires_approval(tokens):
+    if tuple(tokens[:2]) not in {
+        ("git", "status"), ("git", "log"),
+        ("git", "diff"), ("git", "show"),
+    }:
+        return False
+    return any(
+        token == option or token.startswith(f"{option}=")
+        for token in tokens[2:]
+        for option in GIT_SENSITIVE_OPTIONS
+    )
+
+
+def classify_command(command):
+    """回傳 (deny|ask|allow, 給人看的理由)。順序照 deny、ask、allow。"""
+    segments = command_segments(command)
+
+    reason = hard_denial_reason(command)
+    if reason:
+        return "deny", reason
+
+    if any(char in SHELL_METACHARS for char in command):
+        return "ask", "指令含有 shell 特殊字元，實際會做什麼超出字面"
+    if not segments:
+        return "ask", "看不出這條指令要做什麼"
+
+    for segment in segments:
+        tokens = segment_tokens(segment)
+        if not tokens:
+            return "ask", "指令解析不了"
+        if not any(
+            tuple(tokens[: len(safe)]) == safe for safe in SAFE_COMMANDS
+        ):
+            return "ask", f"{tokens[0]} 不在自動放行的唯讀清單裡"
+        if git_requires_approval(tokens):
+            return "ask", "Git 指令含有會寫檔或執行外部程式的參數"
+        if touches_forbidden(tokens):
+            return "ask", "指令碰到了不開放給工具讀取的路徑"
+
+    return "allow", "都是唯讀指令"
+
+
+def touches_forbidden(tokens):
+    """唯讀指令一樣不該自動去讀 .env 這類禁區，所以這裡拿第 7 天那份名單來擋。"""
+    for token in tokens[1:]:
+        if token.startswith("-"):
+            continue
+        # 先看字面上的每一段，這樣 .git/config 這種還沒建立的路徑也擋得住
+        if any(
+            part in IGNORE or part.startswith(".env.")
+            for part in Path(token).parts
+        ):
+            return True
+        # 再看解析後的真正目標，擋掉繞路或符號連結跳出工作目錄
+        try:
+            candidate = BASE_DIR / token
+            exists = candidate.exists() or candidate.is_symlink()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            exists = False
+        target = safe_path(token)
+        if exists and target is None:
+            return True
+        if target is not None and is_ignored(target):
+            return True
+    return False
+
+
+def command_key(command):
+    """用去掉前後空白的完整 command 字串當記憶單位，避免把權限放大。"""
+    if not isinstance(command, str):
+        return None
+    return command.strip() or None
+
+
+def describe_call(name, tool_input):
+    if name == "run_command":
+        return f"執行指令：{tool_input.get('command')}"
+    if name in ("edit_file", "write_file"):
+        return f"{name} 修改檔案：{tool_input.get('file_path')}"
+    return f"{name}({tool_input})"
+
+
+def ask_user(detail, reason=None):
+    """回傳 (是否放行, 要不要記住)。沒有人可以問的時候一律拒絕。"""
+    print(f"      [需要授權] {detail}")
+    if reason:
+        print(f"      理由：{reason}")
+    if not sys.stdin.isatty():
+        print("      （沒有人可以問，自動拒絕）")
+        return False, False
+    try:
+        answer = input("      放行嗎？[y=這次 / a=這個 session 都好 / N=不要] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False, False
+
+    answer = answer.strip().lower()
+    if answer in ("a", "all"):
+        return True, True
+    return answer in ("y", "yes"), False
+
+
+def check_permission(name, tool_input):
+    """回傳 (是否放行, 被擋時要回給模型的訊息)。"""
+    if name in READ_ONLY_TOOLS:
+        return True, None
+
+    if name == "run_command":
+        command = tool_input.get("command", "")
+        verdict, reason = classify_command(command)
+        if verdict == "deny":
+            return False, f"錯誤：這個操作被安全規則擋下來了（{reason}），沒有執行。"
+        if verdict == "allow":
+            return True, None
+
+        key = command_key(command)
+        if key and key in GRANTED_COMMANDS:
+            return True, None
+
+        allowed, remember = ask_user(describe_call(name, tool_input), reason)
+        if not allowed:
+            return False, "錯誤：使用者拒絕執行這個指令。"
+        if remember and key:
+            GRANTED_COMMANDS.add(key)
+        return True, None
+
+    if name in ("edit_file", "write_file"):
+        target = safe_write_path(tool_input.get("file_path", ""))
+        if target is not None and target in GRANTED_WRITES:
+            return True, None
+
+        allowed, remember = ask_user(describe_call(name, tool_input))
+        if not allowed:
+            return False, "錯誤：使用者拒絕修改這個檔案。"
+        if remember and target is not None:
+            GRANTED_WRITES.add(target)
+        return True, None
+
+    return True, None
+
+
 def call_tool(block):
     func = TOOL_FUNCS.get(block.name)
     if func is None:
@@ -750,6 +1023,19 @@ def run_tools(blocks):
             continue
 
         print(f"  [執行工具] {block.name}({block.input})")
+        try:
+            allowed, refusal = check_permission(block.name, block.input)
+        except KeyboardInterrupt:
+            interrupted = True
+            results.append(
+                tool_result(block.id, "錯誤：使用者中斷了授權詢問。", True)
+            )
+            continue
+        if not allowed:
+            print(f"      [已擋下] {refusal}")
+            results.append(tool_result(block.id, refusal, True))
+            continue
+
         try:
             output, is_error = call_tool(block)
         except KeyboardInterrupt:
@@ -878,7 +1164,7 @@ def run_agent(client, history):
 def main():
     client = anthropic.Anthropic()
     history = []
-    print("KeSi。輸入 /exit 離開、/reset 清空對話。")
+    print("KeSi。輸入 /exit 離開、/reset 清空對話、/permissions 看授權、/revoke 收回授權。")
     while True:
         try:
             user = input("你 > ").strip()
@@ -890,6 +1176,19 @@ def main():
             history = []
             READ_VERSIONS.clear()
             print("（日記與檔案版本紀錄已清空，我們重新開始）")
+            continue
+        if user == "/permissions":
+            commands = sorted(GRANTED_COMMANDS)
+            writes = sorted(
+                path.relative_to(BASE_DIR).as_posix() for path in GRANTED_WRITES
+            )
+            print(f"  已放行的指令：{'、'.join(commands) or '（無）'}")
+            print(f"  已放行的檔案：{'、'.join(writes) or '（無）'}")
+            continue
+        if user == "/revoke":
+            GRANTED_COMMANDS.clear()
+            GRANTED_WRITES.clear()
+            print("（這個 session 的授權已全部收回）")
             continue
         if not user:
             continue

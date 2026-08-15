@@ -17,6 +17,7 @@
 - [Day 11 - 執行 shell 指令](https://kaochenlong.com/run-shell-commands-from-an-agent)
 - [Day 12 - 讓迴圈停得下來](https://kaochenlong.com/keep-agent-loops-under-control)
 - [Day 13 - 【實戰】放手修一個 bug](https://kaochenlong.com/let-an-agent-fix-a-bug)
+- [Day 14 - 把 rm -rf 攔下來](https://kaochenlong.com/add-permissions-to-an-agent)
 
 by eddie@5xcampus.com
 
