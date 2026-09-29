@@ -19,6 +19,7 @@
 - [Day 13 - 【實戰】放手修一個 bug](https://kaochenlong.com/let-an-agent-fix-a-bug)
 - [Day 14 - 把 rm -rf 攔下來](https://kaochenlong.com/add-permissions-to-an-agent)
 - [Day 15 - 把 agent 關在工作目錄](https://kaochenlong.com/restrict-an-agent-to-the-workspace)
+- [Day 16 - system prompt 該寫什麼](https://kaochenlong.com/write-a-coding-agent-system-prompt)
 
 by eddie@5xcampus.com
 
