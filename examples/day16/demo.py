@@ -25,6 +25,7 @@ cat ~/.ssh/config 會真的把檔案內容讀出來送給模型。所以這支�
 有 sandbox-exec 的 macOS 上跑，其他平台或設了 KESI_NO_SANDBOX=1 會直接結束。
 """
 
+import contextlib
 import importlib.util
 import os
 import shutil
@@ -80,7 +81,7 @@ CONDITIONS = [("沒有 system prompt", False), ("有 system prompt", True)]
 
 
 class Metered:
-    """包一層記帳，不動 kesi.py 本體。run_agent 只用到 client.messages.create。"""
+    """包一層記帳，不動 kesi.py 本體。第 17 天之後 run_agent 改用 messages.stream()。"""
 
     def __init__(self, client):
         self._client = client
@@ -94,6 +95,19 @@ class Metered:
         resp = self._client.messages.create(**kwargs)
         self.calls.append((resp.usage.input_tokens, resp.usage.output_tokens))
         return resp
+
+    @contextlib.contextmanager
+    def stream(self, **kwargs):
+        with self._client.messages.stream(**kwargs) as stream:
+            original = stream.get_final_message
+
+            def get_final_message():
+                resp = original()
+                self.calls.append((resp.usage.input_tokens, resp.usage.output_tokens))
+                return resp
+
+            stream.get_final_message = get_final_message
+            yield stream
 
 
 def always_yes(detail, reason=None):
@@ -130,8 +144,8 @@ def ask_kesi(client, question, with_system):
         answer = kesi.run_agent(metered, history)
     finally:
         kesi.system_prompt = original
-    # 多行的回答往右縮排，跟「KeSi > 」對齊，方便跟文章裡的節錄對照
-    print("KeSi > " + answer.replace("\n", "\n       ") + "\n")
+    # 第 17 天之後回答在串流時就印出來了，這裡不用再印一次
+    print()
 
     return {
         "tools": count_tool_calls(history),

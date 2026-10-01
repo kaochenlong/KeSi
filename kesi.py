@@ -1323,19 +1323,105 @@ def system_prompt():
     ]
 
 
+class StreamFailure(Exception):
+    """串流已開始後發生的 API 錯誤，連同當下可用的快照一起帶出去。"""
+
+    def __init__(self, cause, snapshot, finished):
+        super().__init__(str(cause))
+        self.cause = cause
+        self.snapshot = snapshot
+        self.finished = finished
+
+
+def stream_turn(client, history):
+    """送出一輪並分段印出。回傳（回應、完成的積木數、是否被中斷）。
+
+    被中斷時回的是快照，而快照的最後一塊可能組到一半，所以要一起回報
+    「有幾塊是完整的」，呼叫端才知道哪些能放進日記。
+    """
+    stream = None
+    started = False
+    finished = 0
+    printed = False
+    try:
+        with client.messages.stream(
+            model="claude-haiku-4-5",
+            max_tokens=1024,
+            system=system_prompt(),
+            tools=TOOLS,
+            messages=history,
+        ) as active:
+            stream = active
+            for event in active:
+                if event.type == "message_start":
+                    started = True
+                elif event.type == "content_block_stop":
+                    finished = event.index + 1
+                elif (
+                    event.type == "content_block_delta"
+                    and event.delta.type == "text_delta"
+                ):
+                    if not printed:
+                        print("KeSi > ", end="", flush=True)
+                        printed = True
+                    print(event.delta.text, end="", flush=True)
+            if printed:
+                print()
+            return active.get_final_message(), finished, False
+    except KeyboardInterrupt:
+        if printed:
+            print()
+        snapshot = (
+            stream.current_message_snapshot
+            if stream is not None and started
+            else None
+        )
+        return snapshot, finished, True
+    except anthropic.AnthropicError as exc:
+        if stream is None:
+            raise
+        if printed:
+            print()
+        snapshot = stream.current_message_snapshot if started else None
+        raise StreamFailure(exc, snapshot, finished) from exc
+
+
+def say(message):
+    """串流之外的訊息由這裡統一輸出，回傳值只給程式用。"""
+    print(f"KeSi > {message}")
+    return message
+
+
 def run_agent(client, history):
     failures = 0
     for turn in range(1, MAX_TURNS + 1):
         try:
-            resp = client.messages.create(
-                model="claude-haiku-4-5",
-                max_tokens=1024,
-                system=system_prompt(),
-                tools=TOOLS,
-                messages=history,
+            resp, finished, interrupted = stream_turn(client, history)
+        except StreamFailure as failure:
+            # 串流已開始才失敗：留下完成的文字，工具單一律不執行也不寫進日記
+            usable = (
+                list(failure.snapshot.content[:failure.finished])
+                if failure.snapshot is not None
+                else []
             )
+            usable = [block for block in usable if block_type(block) == "text"]
+            if usable:
+                history.append({"role": "assistant", "content": usable})
+            message = describe_api_error(failure.cause)
+            history.append({"role": "assistant", "content": message})
+            return say(message)
         except anthropic.AnthropicError as exc:
-            return describe_api_error(exc)
+            return say(describe_api_error(exc))
+
+        if interrupted:
+            # 只留已經完整的積木，組到一半的工具單丟掉
+            usable = list(resp.content[:finished]) if resp is not None else []
+            if usable:
+                history.append({"role": "assistant", "content": usable})
+                seal_dangling_tool_use(history)
+            message = "（這一輪被中斷了，還沒完成的部分沒有留下）"
+            history.append({"role": "assistant", "content": message})
+            return say(message)
 
         if resp.stop_reason in ("max_tokens", "model_context_window_exceeded"):
             reason = (
@@ -1345,11 +1431,12 @@ def run_agent(client, history):
             )
             message = f"錯誤：模型{reason}，本輪沒有執行工具。"
             history.append({"role": "assistant", "content": message})
-            return message
+            return say(message)
 
         history.append({"role": "assistant", "content": resp.content})
 
         if resp.stop_reason != "tool_use":
+            # 文字在串流的時候已經印出來了，這裡只把它交還給呼叫端
             return "".join(b.text for b in resp.content if b.type == "text")
 
         results, interrupted = run_tools(resp.content)
@@ -1358,7 +1445,7 @@ def run_agent(client, history):
         if interrupted:
             message = "（這一輪被中斷了，還沒完成的工作沒有繼續）"
             history.append({"role": "assistant", "content": message})
-            return message
+            return say(message)
 
         if all(result["is_error"] for result in results):
             failures += 1
@@ -1368,7 +1455,7 @@ def run_agent(client, history):
                     f"在第 {turn} 圈停下來，請換個方式再試。"
                 )
                 history.append({"role": "assistant", "content": message})
-                return message
+                return say(message)
         else:
             failures = 0
 
@@ -1377,7 +1464,7 @@ def run_agent(client, history):
         "可以換個問法、把任務拆小，或用 /reset 重來。"
     )
     history.append({"role": "assistant", "content": message})
-    return message
+    return say(message)
 
 
 def main():
@@ -1416,7 +1503,8 @@ def main():
 
         history.append({"role": "user", "content": user})
         try:
-            print("KeSi >", run_agent(client, history))
+            # 顯示全部交給 run_agent，正常回應在串流時就已經印出來了
+            run_agent(client, history)
         except KeyboardInterrupt:
             seal_dangling_tool_use(history)
             print("\n（已中斷，可以接著問下一句）")

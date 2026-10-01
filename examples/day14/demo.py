@@ -88,8 +88,9 @@ def pytest_tail():
 def ask_kesi(client, question):
     history = [{"role": "user", "content": question}]
     print(f"你 > {question}")
-    answer = kesi.run_agent(client, history)
-    print(f"KeSi > {answer}\n")
+    # 第 17 天之後回答在串流時就印出來了，這裡不用再印一次
+    kesi.run_agent(client, history)
+    print()
 
 
 def reset(with_shell=True):

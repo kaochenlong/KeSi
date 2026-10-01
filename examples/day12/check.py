@@ -218,12 +218,33 @@ def check_error_kinds():
 def check_stop_reasons():
     print("\n# 8. 截斷原因要分開回報")
 
+    class FixedStream:
+        """第 17 天改成串流之後，run_agent 呼叫的是 stream()，這裡只送一個 message_start。"""
+
+        def __init__(self, message):
+            self.message = message
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def __iter__(self):
+            return iter([SimpleNamespace(type="message_start")])
+
+        def get_final_message(self):
+            return self.message
+
     class FixedMessages:
         def __init__(self, stop_reason):
             self.stop_reason = stop_reason
 
         def create(self, **kwargs):
             return SimpleNamespace(stop_reason=self.stop_reason, content=[])
+
+        def stream(self, **kwargs):
+            return FixedStream(self.create(**kwargs))
 
     max_history = [{"role": "user", "content": "hi"}]
     max_answer = kesi.run_agent(

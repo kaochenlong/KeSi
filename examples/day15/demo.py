@@ -66,7 +66,9 @@ def ask_kesi(client, question):
     kesi.READ_VERSIONS.clear()
     history = [{"role": "user", "content": question}]
     print(f"你 > {question}")
-    print(f"KeSi > {kesi.run_agent(client, history)}\n")
+    # 第 17 天之後回答在串流時就印出來了，這裡不用再印一次
+    kesi.run_agent(client, history)
+    print()
 
 
 def main():

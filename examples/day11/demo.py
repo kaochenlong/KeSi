@@ -48,7 +48,8 @@ history = []
 def ask(question):
     print(f"\n你 > {question}")
     history.append({"role": "user", "content": question})
-    print("KeSi >", kesi.run_agent(client, history))
+    # 第 17 天之後回答在串流時就印出來了，這裡不用再印一次
+    kesi.run_agent(client, history)
 
 
 print(f"測試專案：{work}")

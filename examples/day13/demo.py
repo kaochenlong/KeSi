@@ -23,6 +23,7 @@ agent 會怎麼收尾」：
 沒有改 kesi.py，正式的計價功能第 18 天才裝進本體。
 """
 
+import contextlib
 import difflib
 import importlib.util
 import os
@@ -63,7 +64,7 @@ QUESTION = "跑一下測試，有一條過不了，幫我找出原因並修好"
 
 
 class Metered:
-    """包一層記帳，不動 kesi.py 本體。run_agent 只用到 client.messages.create。"""
+    """包一層記帳，不動 kesi.py 本體。第 17 天之後 run_agent 改用 messages.stream()。"""
 
     def __init__(self, client):
         self._client = client
@@ -83,6 +84,25 @@ class Metered:
             "stop": resp.stop_reason,
         })
         return resp
+
+    @contextlib.contextmanager
+    def stream(self, **kwargs):
+        started = time.monotonic()
+        with self._client.messages.stream(**kwargs) as stream:
+            original = stream.get_final_message
+
+            def get_final_message():
+                resp = original()
+                self.calls.append({
+                    "input": resp.usage.input_tokens,
+                    "output": resp.usage.output_tokens,
+                    "elapsed": time.monotonic() - started,
+                    "stop": resp.stop_reason,
+                })
+                return resp
+
+            stream.get_final_message = get_final_message
+            yield stream
 
     @property
     def cost(self):
@@ -157,9 +177,10 @@ def main():
     print(f"## 過程\n你 > {QUESTION}")
 
     started = time.monotonic()
-    answer = kesi.run_agent(client, history)
+    # 第 17 天之後回答在串流時就印出來了，這裡不用再印一次
+    kesi.run_agent(client, history)
     elapsed = time.monotonic() - started
-    print(f"KeSi > {answer}\n")
+    print()
 
     code, tail = pytest_summary()
     print(f"## 終點\npytest 結束碼 {code}：{tail}\n")
