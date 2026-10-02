@@ -195,6 +195,7 @@ class FakeSnapshot:
             },
         ]
         self.stop_reason = None
+        self.usage = None  # 第 18 天的電表會讀它，假快照沒有帳可以記
 
 
 class FakeStreamError(anthropic.AnthropicError):

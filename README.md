@@ -21,6 +21,7 @@
 - [Day 15 - 把 agent 關在工作目錄](https://kaochenlong.com/restrict-an-agent-to-the-workspace)
 - [Day 16 - system prompt 該寫什麼](https://kaochenlong.com/write-a-coding-agent-system-prompt)
 - [Day 17 - 打開 streaming](https://kaochenlong.com/stream-agent-responses)
+- [Day 18 - 一輪對話要花多少錢](https://kaochenlong.com/measure-agent-token-costs)
 
 by eddie@5xcampus.com
 

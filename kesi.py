@@ -45,6 +45,14 @@ SHELL_PATH = "/bin/sh"
 MAX_TURNS = 20
 MAX_TOOL_FAILURES = 3
 
+# Claude Haiku 4.5 的費率（美元 / 百萬 token），價格會變，用之前先查官方定價頁
+PRICE = {
+    "input": 1.0,
+    "output": 5.0,
+    "cache_write": 1.25,  # 5 分鐘的快取寫入，是 input 的 1.25 倍
+    "cache_read": 0.1,    # 快取命中，是 input 的一折
+}
+
 # 唯讀工具不必問；它們仍受第 7 天的路徑柵欄與禁區名單約束
 READ_ONLY_TOOLS = {"read_file", "list_files", "glob", "grep"}
 
@@ -1333,6 +1341,52 @@ class StreamFailure(Exception):
         self.finished = finished
 
 
+class Meter:
+    """記帳用的電表，每一次 API 請求的 usage 都記一筆。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def record(self, usage, *, partial=False):
+        if usage is None:
+            return
+        self.calls.append({
+            "input": usage.input_tokens or 0,
+            "output": usage.output_tokens or 0,
+            "cache_write": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            "cache_read": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "partial": partial,
+        })
+
+    def totals(self, since=0):
+        total = {key: 0 for key in PRICE}
+        for call in self.calls[since:]:
+            for key in PRICE:
+                total[key] += call[key]
+        return total
+
+    def cost(self, since=0):
+        total = self.totals(since)
+        return sum(total[key] / 1e6 * PRICE[key] for key in PRICE)
+
+    def report(self, since=0):
+        total = self.totals(since)
+        requests = len(self.calls) - since
+        partial = sum(call["partial"] for call in self.calls[since:])
+        parts = [f"input {total['input']:,}", f"output {total['output']:,}"]
+        if total["cache_read"] or total["cache_write"]:
+            parts.append(f"快取讀 {total['cache_read']:,}")
+            parts.append(f"快取寫 {total['cache_write']:,}")
+        note = f"，其中 {partial} 次只算到中斷前收到的部分" if partial else ""
+        return (
+            f"（本輪 {requests} 次請求，{'、'.join(parts)}，"
+            f"${self.cost(since):.4f}{note}；累計 ${self.cost():.4f}）"
+        )
+
+
+METER = Meter()
+
+
 def stream_turn(client, history):
     """送出一輪並分段印出。回傳（回應、完成的積木數、是否被中斷）。
 
@@ -1367,7 +1421,9 @@ def stream_turn(client, history):
                     print(event.delta.text, end="", flush=True)
             if printed:
                 print()
-            return active.get_final_message(), finished, False
+            final = active.get_final_message()
+            METER.record(final.usage)
+            return final, finished, False
     except KeyboardInterrupt:
         if printed:
             print()
@@ -1376,13 +1432,19 @@ def stream_turn(client, history):
             if stream is not None and started
             else None
         )
+        if snapshot is not None:
+            # 中斷時拿不到最後的 message_delta，只能記目前收到的部分
+            METER.record(snapshot.usage, partial=True)
         return snapshot, finished, True
-    except anthropic.AnthropicError as exc:
+    except Exception as exc:
+        # 串流開始之後斷線，丟出來的是底層 HTTP 套件的錯誤，不是 AnthropicError
         if stream is None:
             raise
         if printed:
             print()
         snapshot = stream.current_message_snapshot if started else None
+        if snapshot is not None:
+            METER.record(snapshot.usage, partial=True)
         raise StreamFailure(exc, snapshot, finished) from exc
 
 
@@ -1470,7 +1532,10 @@ def run_agent(client, history):
 def main():
     client = anthropic.Anthropic()
     history = []
-    print("KeSi。輸入 /exit 離開、/reset 清空對話、/permissions 看授權、/revoke 收回授權。")
+    print(
+        "KeSi。輸入 /exit 離開、/reset 清空對話、/cost 看帳單、"
+        "/permissions 看授權、/revoke 收回授權。"
+    )
     print(f"  工作目錄：{BASE_DIR}")
     print(f"  指令沙箱：{sandbox_status()}")
     while True:
@@ -1484,6 +1549,17 @@ def main():
             history = []
             READ_VERSIONS.clear()
             print("（日記與檔案版本紀錄已清空，我們重新開始）")
+            continue
+        if user == "/cost":
+            total = METER.totals()
+            print(f"  這個 session 共 {len(METER.calls)} 次請求")
+            print(f"  input {total['input']:,}、output {total['output']:,}")
+            if total["cache_read"] or total["cache_write"]:
+                print(
+                    f"  快取讀 {total['cache_read']:,}、"
+                    f"快取寫 {total['cache_write']:,}"
+                )
+            print(f"  合計 ${METER.cost():.4f}")
             continue
         if user == "/permissions":
             commands = sorted(GRANTED_COMMANDS)
@@ -1502,12 +1578,17 @@ def main():
             continue
 
         history.append({"role": "user", "content": user})
+        before = len(METER.calls)
         try:
             # 顯示全部交給 run_agent，正常回應在串流時就已經印出來了
             run_agent(client, history)
         except KeyboardInterrupt:
             seal_dangling_tool_use(history)
             print("\n（已中斷，可以接著問下一句）")
+        finally:
+            # 這一輪有收到 usage 才印，請求在拿到 usage 之前就失敗的話不會多記一筆
+            if len(METER.calls) > before:
+                print(f"  {METER.report(before)}")
 
 
 if __name__ == "__main__":

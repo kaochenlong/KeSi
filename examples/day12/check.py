@@ -241,7 +241,8 @@ def check_stop_reasons():
             self.stop_reason = stop_reason
 
         def create(self, **kwargs):
-            return SimpleNamespace(stop_reason=self.stop_reason, content=[])
+            # 第 18 天的電表會讀 usage，給一個空的
+            return SimpleNamespace(stop_reason=self.stop_reason, content=[], usage=None)
 
         def stream(self, **kwargs):
             return FixedStream(self.create(**kwargs))
